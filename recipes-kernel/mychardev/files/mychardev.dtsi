@@ -1,0 +1,7 @@
+/ {
+    mychardev@0 {
+        compatible = "bogdan,mychardev";
+        buffer-size = <1024>;
+        status = "okay";
+    };
+};

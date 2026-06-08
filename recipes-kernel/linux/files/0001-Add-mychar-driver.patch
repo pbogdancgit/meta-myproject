@@ -1,0 +1,265 @@
+From b24b0cf81c5435e7b297eb672743f7e4c9930a6a Mon Sep 17 00:00:00 2001
+From: OpenEmbedded <oe.patch@oe>
+Date: Wed, 6 May 2026 14:48:11 +0000
+Subject: [PATCH] Add mychar driver
+
+---
+ drivers/char/Kconfig      |   5 +
+ drivers/char/Makefile     |   1 +
+ drivers/char/chardriver.c | 206 ++++++++++++++++++++++++++++++++++++++
+ drivers/char/my1st.h      |   5 +
+ 4 files changed, 217 insertions(+)
+ create mode 100644 drivers/char/chardriver.c
+ create mode 100644 drivers/char/my1st.h
+
+diff --git a/drivers/char/Kconfig b/drivers/char/Kconfig
+index d454428f4981..6077cf637eda 100644
+--- a/drivers/char/Kconfig
++++ b/drivers/char/Kconfig
+@@ -464,4 +464,9 @@ config RANDOM_TRUST_BOOTLOADER
+ 	  believe its RNG facilities may be faulty. This may also be configured
+ 	  at boot time with "random.trust_bootloader=on/off".
+ 
++config MYCHARDEV
++    tristate "My char device driver"
++    help
++      Simple character device driver for testing.
++
+ endmenu
+diff --git a/drivers/char/Makefile b/drivers/char/Makefile
+index 264eb398fdd4..cece0968d0c8 100644
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -46,3 +46,4 @@ obj-$(CONFIG_PS3_FLASH)		+= ps3flash.o
+ obj-$(CONFIG_XILLYBUS_CLASS)	+= xillybus/
+ obj-$(CONFIG_POWERNV_OP_PANEL)	+= powernv-op-panel.o
+ obj-$(CONFIG_ADI)		+= adi.o
++obj-$(CONFIG_MYCHARDEV) += chardriver.o
+\ No newline at end of file
+diff --git a/drivers/char/chardriver.c b/drivers/char/chardriver.c
+new file mode 100644
+index 000000000000..dace504d5d67
+--- /dev/null
++++ b/drivers/char/chardriver.c
+@@ -0,0 +1,206 @@
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/cdev.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/uaccess.h>
++#include "my1st.h"
++
++#define DEVICE_NAME "my1st"
++
++struct my1st_priv {
++    dev_t dev_number;
++    struct cdev cdev;
++    struct class *class;
++    char *buffer;
++    size_t buf_size;
++    size_t data_len;
++};
++
++/* ---------- file operations ---------- */
++
++static ssize_t my_read(struct file *file, char __user *buf, size_t count, loff_t *ppos);
++static ssize_t my_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos);
++static int my_open(struct inode *inode, struct file *file);
++static int my_release(struct inode *inode, struct file *file);
++static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
++
++static const struct file_operations fops = {
++    .owner          = THIS_MODULE,
++    .read           = my_read,
++    .write          = my_write,
++    .open           = my_open,
++    .release        = my_release,
++    .llseek         = default_llseek,
++    .unlocked_ioctl = my_ioctl,
++};
++
++static int my_open(struct inode *inode, struct file *file)
++{
++    struct my1st_priv *priv = container_of(inode->i_cdev, struct my1st_priv, cdev);
++    file->private_data = priv;
++    pr_info("my1st: device opened\n");
++    return 0;
++}
++
++static int my_release(struct inode *inode, struct file *file)
++{
++    pr_info("my1st: device closed\n");
++    return 0;
++}
++
++static ssize_t my_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
++{
++    struct my1st_priv *priv = file->private_data;
++
++    if (*ppos >= priv->data_len)
++        return 0;
++
++    if (count > priv->data_len - *ppos)
++        count = priv->data_len - *ppos;
++
++    if (copy_to_user(buf, priv->buffer + *ppos, count))
++        return -EFAULT;
++
++    *ppos += count;
++    return count;
++}
++
++static ssize_t my_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
++{
++    struct my1st_priv *priv = file->private_data;
++
++    if (count > priv->buf_size)
++        count = priv->buf_size;
++
++    if (copy_from_user(priv->buffer, buf, count))
++        return -EFAULT;
++
++    priv->data_len = count;
++    pr_info("my1st: received %zu bytes: %.*s\n", count, (int)count, priv->buffer);
++    return count;
++}
++
++static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++    struct my1st_priv *priv = file->private_data;
++    int offset;
++
++    switch (cmd) {
++    case MYDRV_CLEAR_FROM_OFFSET:
++        if (copy_from_user(&offset, (int __user *)arg, sizeof(int)))
++            return -EFAULT;
++
++        if (offset < 0 || offset > priv->data_len)
++            return -EINVAL;
++
++        memset(priv->buffer + offset, 0, priv->buf_size - offset);
++        priv->data_len = offset;
++
++        pr_info("IOCTL: cleared from offset %d\n", offset);
++        break;
++
++    case MYDRV_GET_DATA_LEN:
++        pr_info("IOCTL: data_len = %zu\n", priv->data_len);
++        break;
++    }
++
++    return 0;
++}
++
++/* ---------- Device Tree match table ---------- */
++
++static const struct of_device_id my1st_of_match[] = {
++    { .compatible = "bogdan,my1st" },
++    { }
++};
++MODULE_DEVICE_TABLE(of, my1st_of_match);
++
++/* ---------- platform probe/remove ---------- */
++
++static int my1st_probe(struct platform_device *pdev)
++{
++    struct my1st_priv *priv;
++    struct device *dev = &pdev->dev;
++    int ret;
++    u32 buf_size = 128;
++
++    dev_info(dev, "my1st: probe() called from DT\n");
++
++    priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++    if (!priv)
++        return -ENOMEM;
++
++    /* read buffer-size from DT */
++    if (!of_property_read_u32(dev->of_node, "buffer-size", &buf_size))
++        dev_info(dev, "buffer-size from DT: %u\n", buf_size);
++
++    priv->buf_size = buf_size;
++    priv->buffer = devm_kzalloc(dev, priv->buf_size, GFP_KERNEL);
++    if (!priv->buffer)
++        return -ENOMEM;
++
++    memcpy(priv->buffer, "Salutari noi din kernel!", 24);
++    priv->data_len = 24;
++
++    /* allocate char device */
++    ret = alloc_chrdev_region(&priv->dev_number, 0, 1, DEVICE_NAME);
++    if (ret)
++        return ret;
++
++    cdev_init(&priv->cdev, &fops);
++    priv->cdev.owner = THIS_MODULE;
++
++    ret = cdev_add(&priv->cdev, priv->dev_number, 1);
++    if (ret)
++        goto err_chrdev;
++
++    priv->class = class_create(THIS_MODULE, DEVICE_NAME);
++    if (IS_ERR(priv->class)) {
++        ret = PTR_ERR(priv->class);
++        goto err_cdev;
++    }
++
++    device_create(priv->class, NULL, priv->dev_number, NULL, DEVICE_NAME);
++
++    platform_set_drvdata(pdev, priv);
++
++    dev_info(dev, "my1st: registered Major=%d Minor=%d\n",
++             MAJOR(priv->dev_number), MINOR(priv->dev_number));
++    return 0;
++
++err_cdev:
++    cdev_del(&priv->cdev);
++err_chrdev:
++    unregister_chrdev_region(priv->dev_number, 1);
++    return ret;
++}
++
++static int my1st_remove(struct platform_device *pdev)
++{
++    struct my1st_priv *priv = platform_get_drvdata(pdev);
++
++    device_destroy(priv->class, priv->dev_number);
++    class_destroy(priv->class);
++    cdev_del(&priv->cdev);
++    unregister_chrdev_region(priv->dev_number, 1);
++
++    pr_info("my1st: remove()\n");
++    return 0;
++}
++
++static struct platform_driver my1st_driver = {
++    .probe  = my1st_probe,
++    .remove = my1st_remove,
++    .driver = {
++        .name           = "my1st",
++        .of_match_table = my1st_of_match,
++    },
++};
++
++module_platform_driver(my1st_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Bogdan");
++MODULE_DESCRIPTION("Char driver as platform driver with DT");
+diff --git a/drivers/char/my1st.h b/drivers/char/my1st.h
+new file mode 100644
+index 000000000000..eafa1ef89097
+--- /dev/null
++++ b/drivers/char/my1st.h
+@@ -0,0 +1,5 @@
++
++#include <linux/ioctl.h>
++
++#define MYDRV_CLEAR_FROM_OFFSET   _IOW('m', 1, int)
++#define MYDRV_GET_DATA_LEN        _IOR('m', 2, int)
+\ No newline at end of file
+-- 
+2.34.1
+

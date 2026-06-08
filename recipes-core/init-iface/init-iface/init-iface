@@ -1,0 +1,10 @@
+#!/bin/sh
+
+### BEGIN INIT INFO
+# Provides:          init-iface
+# Required-Start:    $local_fs
+# Default-Start:     S
+### END INIT INFO
+
+ip link set eth0 up
+udhcpc -i eth0
